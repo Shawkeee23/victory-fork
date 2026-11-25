@@ -38,6 +38,9 @@
 //! left to the forms of the program in which every lane runs that code (`emit`'s retries: the
 //! skips left out, the branches around it taken wave-wide), where the halves do exchange.
 //! `VICTORY_WAVE_OWN_BITS=0` turns this off.
+//!
+//! The same table is where [`running_totals`] puts the values of a second idiom, the combine
+//! step of a block-wide prefix sum (the ray-tracing structure builder's scans): see there.
 
 use std::collections::{HashMap, HashSet};
 
@@ -781,7 +784,252 @@ pub(super) fn find(p: &Program, st: &Structured, why: bool) -> OwnBits {
             }
         }
     }
+    for (x, at) in running_totals(p) {
+        if why {
+            eprintln!("WAVE64-RUNNING-TOTAL the first-lane read at {at:#x}: every running lane holds the same");
+        }
+        out.alike.insert(x);
+    }
     out
+}
+
+/// Whether `inst` writes EXEC.
+fn writes_exec(inst: &Inst) -> bool {
+    inst.writes.iter().any(|w| matches!(w.0, Reg::S(c) if c == EXEC || c == EXEC + 1))
+}
+
+/// Scalar operations a running total's counters and starting values may be made with.
+const COUNTER_OPS: &[&str] = &[
+    "s_mov_b32", "s_add_i32", "s_add_u32", "s_sub_i32", "s_sub_u32", "s_lshl_b32", "s_lshr_b32",
+    "s_and_b32", "s_or_b32", "s_mul_i32",
+];
+
+struct Totals<'a> {
+    p: &'a Program,
+    def: HashMap<Value, (usize, usize)>,
+    phis: HashMap<Value, (usize, usize)>,
+}
+
+/// The running totals of block-wide prefix sums, as (the value a first-lane read takes, its
+/// place).
+///
+/// A scan over a group of several console waves ends with each wave adding the totals of the
+/// waves before it, one wave at a time, in a loop that a wave leaves once its own number has
+/// come:
+///
+/// ```text
+/// total = 0; i = 0; lanes = the waves with a number above 0
+/// loop {
+///     x = total + lds[i];  i += 1             // lanes still running
+///     saved = EXEC
+///     EXEC = the lanes whose wave number is i; lanes -= those lanes     // they keep their x
+///     if lanes == 0 { break }
+///     EXEC = saved & lanes
+///     total = readfirstlane(x)                // the next round's start
+/// }
+/// ```
+///
+/// Where not every lane runs, the first lane of the console wave cannot be asked from the other
+/// host wave. It need not be: `x` is the sum of a scalar and one word of LDS read at a scalar
+/// address, so every lane that ran the round holds the same, and the lanes that read it are
+/// among those (EXEC is the copy taken right after the sum, less lanes). The first lane's `x`
+/// is each lane's own. [`Totals::total`] proves that for the instructions it names, and
+/// refuses the loop for anything else:
+///
+/// - the read is the last instruction of a block `Y` that only the loop's block `Z` enters and
+///   leaves back into `Z`, which writes EXEC once, with `saved & other`, `saved` being a copy
+///   of EXEC that `Z` took after the sum with no EXEC write in between, and EXEC is not
+///   written in `Z` before the sum;
+/// - the sum is `v_add_nc_u32` of a scalar and a VGPR the loop made by `ds_read_b32` at an
+///   address made by `v_mov_b32` of a scalar, all in `Z` and unmodified;
+/// - the scalars (the one added, the address) are made by counting scalar operations and
+///   constants, joined by the loop, and by the first-lane read itself (the induction);
+/// - `Y` and `Z` run no effect: nothing writes LDS, no barrier.
+fn running_totals(p: &Program) -> Vec<(Value, usize)> {
+    let mut def = HashMap::new();
+    let mut phis = HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (k, phi) in block.phis.iter().enumerate() {
+            phis.insert(phi.value, (b, k));
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            for &(_, w) in &inst.writes {
+                def.insert(w, (b, i));
+            }
+        }
+    }
+    let t = Totals { p, def, phis };
+    let mut out = Vec::new();
+    for (yb, block) in p.blocks.iter().enumerate() {
+        for (yi, inst) in block.insts.iter().enumerate() {
+            if inst.name() == "v_readfirstlane_b32" {
+                if let Some(x) = t.total(yb, yi) {
+                    out.push((x, inst.machine.offset));
+                }
+            }
+        }
+    }
+    out
+}
+
+impl Totals<'_> {
+    /// The VGPR value the first-lane read at `yi` of block `yb` reads, if the loop is a
+    /// running total (see [`running_totals`]).
+    fn total(&self, yb: usize, yi: usize) -> Option<Value> {
+        let p = self.p;
+        let y = &p.blocks[yb];
+        let rfl = &y.insts[yi];
+        let Fields::Valu(v) = &rfl.fields else {
+            return None;
+        };
+        let Some(&Operand::Vector { reg, .. }) = v.src.first() else {
+            return None;
+        };
+        let x = rfl.read(Reg::V(reg))?;
+        let r = rfl.writes.iter().find(|w| matches!(w.0, Reg::S(_)))?.1;
+
+        // Y: entered only from Z, leaves into Z, ends with the read; its one EXEC write is
+        // `saved & other`
+        let [z] = y.preds[..] else {
+            return None;
+        };
+        if !matches!(y.exit, Exit::Jump(t) if t == z) || yi + 1 != y.insts.len() {
+            return None;
+        }
+        let zblk = &p.blocks[z];
+        if !matches!(zblk.exit, Exit::Branch { taken, .. } if taken == yb) || !zblk.preds.contains(&yb) {
+            return None;
+        }
+        if y.insts.iter().chain(&zblk.insts).any(effect) {
+            return None;
+        }
+        let mut writers = y.insts.iter().enumerate().filter(|(_, i)| writes_exec(i));
+        let (_, and) = writers.next()?;
+        if writers.next().is_some() || and.name() != "s_and_b64" {
+            return None;
+        }
+        let Fields::Sop { dst: Some(Operand::Scalar { code: EXEC, .. }), src, .. } = &and.fields else {
+            return None;
+        };
+
+        // the copy of EXEC it starts from, taken in Z
+        let mut copy = None;
+        for o in src {
+            let Operand::Scalar { code, .. } = *o else {
+                continue;
+            };
+            let Some(m) = and.read(Reg::S(code)) else {
+                continue;
+            };
+            let Some(&(b, j)) = self.def.get(&m) else {
+                continue;
+            };
+            let c = &p.blocks[b].insts[j];
+            let from_exec = matches!(&c.fields, Fields::Sop { src, .. }
+                if matches!(src[..], [Operand::Scalar { code: EXEC, .. }]));
+            if b == z && c.name() == "s_mov_b64" && from_exec {
+                copy = Some(j);
+            }
+        }
+        let j = copy?;
+
+        // the sum, in Z, before the copy, with EXEC as Z was entered
+        let &(db, di) = self.def.get(&x)?;
+        if db != z {
+            return None;
+        }
+        let d = &zblk.insts[di];
+        if d.name() != "v_add_nc_u32" || di >= j {
+            return None;
+        }
+        if zblk.insts[..=j].iter().any(writes_exec) {
+            return None;
+        }
+        let (s_op, v_op) = Self::scalar_and_vector(d)?;
+        let s = d.read(Reg::S(s_op))?;
+        let l = d.read(Reg::V(v_op))?;
+
+        // the LDS word, at a scalar address
+        let &(eb, ei) = self.def.get(&l)?;
+        if eb != z {
+            return None;
+        }
+        let e = &zblk.insts[ei];
+        let Fields::Ds { addr: Some(Operand::Vector { reg: ar, .. }), .. } = &e.fields else {
+            return None;
+        };
+        if e.name() != "ds_read_b32" || ei >= di {
+            return None;
+        }
+        let a = e.read(Reg::V(*ar))?;
+        let &(fb, fi) = self.def.get(&a)?;
+        if fb != z {
+            return None;
+        }
+        let f = &zblk.insts[fi];
+        let Fields::Valu(fv) = &f.fields else {
+            return None;
+        };
+        let Some(&Operand::Scalar { code: kc, .. }) = fv.src.first() else {
+            return None;
+        };
+        if f.name() != "v_mov_b32" || fi >= ei || kc == NULL || fv.src.len() != 1 {
+            return None;
+        }
+        let k = f.read(Reg::S(kc))?;
+
+        let mut seen = HashSet::new();
+        (self.same(s, r, &mut seen) && self.same(k, r, &mut seen)).then_some(x)
+    }
+
+    /// The scalar and the vector register an unmodified two-source `v_add_nc_u32` adds.
+    fn scalar_and_vector(d: &Inst) -> Option<(u8, u8)> {
+        let Fields::Valu(v) = &d.fields else {
+            return None;
+        };
+        if v.dpp.is_some() || v.sdwa.is_some() || v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 {
+            return None;
+        }
+        match v.src[..] {
+            [Operand::Scalar { code, .. }, Operand::Vector { reg, .. }]
+            | [Operand::Vector { reg, .. }, Operand::Scalar { code, .. }]
+                if code != NULL =>
+            {
+                Some((code, reg))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether scalar value `v` is the same in every lane that holds it: made by counting
+    /// scalar operations from constants, and joins of such, and `r` (the first-lane read being
+    /// proved, which the induction assumes). A value being visited counts as proved, so a
+    /// counter joined with its own increment passes.
+    fn same(&self, v: Value, r: Value, seen: &mut HashSet<Value>) -> bool {
+        if v == r || !seen.insert(v) {
+            return true;
+        }
+        if let Some(&(b, k)) = self.phis.get(&v) {
+            let phi = &self.p.blocks[b].phis[k];
+            return matches!(phi.reg, Reg::S(c) if c < EXEC) && phi.args.iter().all(|&a| self.same(a, r, seen));
+        }
+        let Some(&(b, i)) = self.def.get(&v) else {
+            return false;
+        };
+        let inst = &self.p.blocks[b].insts[i];
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return false;
+        };
+        COUNTER_OPS.contains(&inst.name())
+            && src.iter().all(|o| match *o {
+                Operand::Scalar { code, .. } if code != NULL => {
+                    inst.read(Reg::S(code)).is_some_and(|x| self.same(x, r, seen))
+                }
+                Operand::Scalar { .. } | Operand::Literal(_) => true,
+                Operand::Const(c) => crate::resource::inline(c).is_some(),
+                _ => false,
+            })
+    }
 }
 
 #[cfg(test)]
