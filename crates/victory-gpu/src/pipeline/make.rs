@@ -59,6 +59,11 @@ impl Pending {
         }
     }
 
+    /// Its shaders as the logs name them (stage and hash).
+    pub(crate) fn shaders_named(&self) -> String {
+        format!("{:?}", self.shaders)
+    }
+
     fn make(&self) {
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));

@@ -379,7 +379,11 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // `VICTORY_WAVE_WIDE=builder`: only for the programs with a spilled user-data table
+        // (the ray-tracing structure builder's and trace programs), the ones that must
+        // translate for the builder to run (see `victory_gpu::pipeline`'s `Builder`).
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE")
+            .is_some_and(|v| v == "1" || (v == "builder" && crate::spill::is_spilled(native)));
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
